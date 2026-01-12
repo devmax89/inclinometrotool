@@ -47,25 +47,7 @@ pip install -r requirements.txt
 
 ### Configurazione
 
-Modifica il file `.env` con le credenziali corrette:
-
-```env
-# URL API
-AUTH_URL=https://rh-sso.apps.clusterzac.opencs.servizi.prv/auth/realms/DigilV2/protocol/openid-connect/token
-CMD_URL=https://digil-back-end-onesait.servizi.prv/api/v1/digils/{deviceid}/command
-DEVICE_URL=https://digil-back-end-onesait.servizi.prv/api/v1/digils/{deviceid}
-
-# Credenziali
-CLIENT_ID=application
-CLIENT_SECRET=your_secret_here
-
-# Configurazione
-RETRY_INTERVAL_SECONDS=30
-MAX_RETRY_MINUTES_MASTER=10
-MAX_RETRY_MINUTES_SLAVE=20
-MAX_THREADS=87
-INCL_TOLERANCE=0.20
-```
+Modifica il file `.env` con le credenziali corrette
 
 ---
 
