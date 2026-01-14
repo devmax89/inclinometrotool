@@ -118,6 +118,110 @@ class InputLoader:
         }
 
 
+class Phase2InputLoader:
+    """
+    Carica il file Excel di input per la Fase 2 (output della Fase 1).
+    Struttura attesa: deviceid, tipo, manutenzione_on, reset_inclinometro, manutenzione_off, reset_timestamp
+    """
+    
+    def __init__(self):
+        self.file_path: Optional[Path] = None
+        self._df: Optional[pd.DataFrame] = None
+        self._devices: List[Dict] = []
+    
+    def load_file(self, file_path: str) -> Tuple[bool, str, int]:
+        """
+        Carica il file Excel di input per la Fase 2.
+        Filtra solo i device con reset_inclinometro = "OK" e reset_timestamp valido.
+        
+        Returns:
+            (success, message, device_count)
+        """
+        path = Path(file_path)
+        
+        if not path.exists():
+            return False, f"File non trovato: {path}", 0
+        
+        try:
+            self._df = pd.read_excel(path, engine='openpyxl')
+            
+            # Verifica colonne necessarie
+            required_cols = ['deviceid', 'reset_timestamp']
+            missing = [c for c in required_cols if c not in self._df.columns]
+            if missing:
+                return False, f"Colonne mancanti: {missing}", 0
+            
+            # Filtra solo i device con reset OK e timestamp valido
+            self._devices = []
+            total_rows = 0
+            skipped_not_ok = 0
+            skipped_no_timestamp = 0
+            
+            for _, row in self._df.iterrows():
+                total_rows += 1
+                deviceid = str(row.get('deviceid', '')).strip()
+                
+                if not deviceid or deviceid.lower() == 'nan':
+                    continue
+                
+                # Controlla se reset_inclinometro è OK (se la colonna esiste)
+                reset_status = str(row.get('reset_inclinometro', 'OK')).strip().upper()
+                if reset_status != 'OK':
+                    skipped_not_ok += 1
+                    continue
+                
+                # Controlla timestamp
+                reset_timestamp = row.get('reset_timestamp')
+                if pd.isna(reset_timestamp) or reset_timestamp == '':
+                    skipped_no_timestamp += 1
+                    continue
+                
+                try:
+                    reset_timestamp = int(float(reset_timestamp))
+                except (ValueError, TypeError):
+                    skipped_no_timestamp += 1
+                    continue
+                
+                self._devices.append({
+                    'deviceid': deviceid,
+                    'tipo': str(row.get('tipo', 'unknown')).strip(),
+                    'reset_timestamp': reset_timestamp
+                })
+            
+            self.file_path = path
+            
+            msg_parts = [f"Caricati {len(self._devices)} dispositivi da verificare"]
+            if skipped_not_ok > 0:
+                msg_parts.append(f"{skipped_not_ok} saltati (reset non OK)")
+            if skipped_no_timestamp > 0:
+                msg_parts.append(f"{skipped_no_timestamp} saltati (timestamp mancante)")
+            
+            return True, " | ".join(msg_parts), len(self._devices)
+            
+        except Exception as e:
+            return False, f"Errore lettura file: {str(e)}", 0
+    
+    def get_devices(self) -> List[Dict]:
+        """Restituisce la lista dei device da verificare con i loro timestamp"""
+        return self._devices
+    
+    def get_summary(self) -> Dict:
+        """Restituisce un riepilogo dei dati caricati"""
+        if not self._devices:
+            return {"loaded": False}
+        
+        master_count = sum(1 for d in self._devices if d.get('tipo') == 'master')
+        slave_count = len(self._devices) - master_count
+        
+        return {
+            "loaded": True,
+            "file": str(self.file_path) if self.file_path else "",
+            "total": len(self._devices),
+            "master": master_count,
+            "slave": slave_count
+        }
+
+
 class ResultExporter:
     """Esporta i risultati in file Excel formattati"""
     
@@ -137,8 +241,7 @@ class ResultExporter:
         - manutenzione_on
         - reset_inclinometro
         - manutenzione_off
-        - reset_timestamp (epoch ms)
-        - reset_datetime (human readable)
+        - reset_timestamp (epoch ms) - usato come input per Fase 2
         """
         if not results:
             return False, "Nessun risultato da esportare"
@@ -148,7 +251,7 @@ class ResultExporter:
             output_path = self.output_dir / f"Reset_Inclinometro_Fase1_{timestamp}.xlsx"
         
         try:
-            # Prepara i dati
+            # Prepara i dati - SENZA reset_datetime
             data = []
             for r in results:
                 data.append({
@@ -157,8 +260,7 @@ class ResultExporter:
                     "manutenzione_on": r.manutenzione_on,
                     "reset_inclinometro": r.reset_inclinometro,
                     "manutenzione_off": r.manutenzione_off,
-                    "reset_timestamp": r.reset_timestamp if r.reset_timestamp else "",
-                    "reset_datetime": r.reset_datetime
+                    "reset_timestamp": r.reset_timestamp if r.reset_timestamp else ""
                 })
             
             df = pd.DataFrame(data)
@@ -199,8 +301,7 @@ class ResultExporter:
                 worksheet.set_column(0, 0, 15)  # deviceid
                 worksheet.set_column(1, 1, 8)   # tipo
                 worksheet.set_column(2, 4, 15)  # manutenzione/reset
-                worksheet.set_column(5, 5, 15)  # timestamp
-                worksheet.set_column(6, 6, 20)  # datetime
+                worksheet.set_column(5, 5, 18)  # reset_timestamp
                 
                 # Formattazione condizionale per reset_inclinometro (colonna D, index 3)
                 worksheet.conditional_format(1, 3, len(df), 3, {
@@ -259,6 +360,15 @@ class ResultExporter:
                                output_path: Optional[str] = None) -> Tuple[bool, str]:
         """
         Esporta i risultati della Fase 2 (Verifica).
+        
+        Colonne output:
+        - deviceid, tipo, all_ok
+        - alarm_incl, alarm_ok
+        - inc_x_avg, inc_x_ok
+        - inc_y_avg, inc_y_ok
+        - timestamp_valid, timestamp_delta_readable
+        - reset_timestamp, data_timestamp, data_datetime
+        - status, error_message
         """
         if not results:
             return False, "Nessun risultato da esportare"
@@ -272,14 +382,14 @@ class ResultExporter:
             data = [r.to_dict() for r in results]
             df = pd.DataFrame(data)
             
-            # Riordina colonne
+            # Riordina colonne - NUOVA STRUTTURA
             col_order = [
                 "deviceid", "tipo", "all_ok",
                 "alarm_incl", "alarm_ok",
                 "inc_x_avg", "inc_x_ok",
                 "inc_y_avg", "inc_y_ok",
                 "timestamp_valid", "timestamp_delta_readable",
-                "reset_datetime", "verify_datetime",
+                "reset_timestamp", "data_timestamp", "data_datetime",
                 "status", "error_message"
             ]
             df = df[[c for c in col_order if c in df.columns]]
@@ -315,14 +425,15 @@ class ResultExporter:
                 for col_num, value in enumerate(df.columns):
                     worksheet.write(0, col_num, value, header_format)
                 
-                # Larghezze
+                # Larghezze colonne
                 worksheet.set_column(0, 0, 15)   # deviceid
                 worksheet.set_column(1, 1, 8)    # tipo
                 worksheet.set_column(2, 2, 8)    # all_ok
                 worksheet.set_column(3, 10, 12)  # check columns
-                worksheet.set_column(11, 12, 20) # datetimes
-                worksheet.set_column(13, 13, 15) # status
-                worksheet.set_column(14, 14, 30) # error
+                worksheet.set_column(11, 12, 18) # timestamps
+                worksheet.set_column(13, 13, 20) # data_datetime
+                worksheet.set_column(14, 14, 15) # status
+                worksheet.set_column(15, 15, 30) # error
                 
                 # Formattazione condizionale per all_ok (colonna C, index 2)
                 worksheet.conditional_format(1, 2, len(df), 2, {

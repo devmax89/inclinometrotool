@@ -27,7 +27,7 @@ from PyQt5.QtGui import QColor, QPixmap
 
 from reset_worker import ResetWorker, ResetResult, ResetStatus, detect_device_type
 from verify_worker import VerifyWorker, VerifyResult, VerifyStatus
-from data_handler import InputLoader, ResultExporter
+from data_handler import InputLoader, Phase2InputLoader, ResultExporter
 from api_client import get_token_manager
 
 
@@ -166,7 +166,8 @@ class MainWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.input_loader = InputLoader()
+        self.input_loader = InputLoader()           # Per Fase 1
+        self.phase2_loader = Phase2InputLoader()    # Per Fase 2 (autonomo)
         self.exporter = ResultExporter()
         self.reset_thread: Optional[ResetThread] = None
         self.verify_thread: Optional[VerifyThread] = None
@@ -345,7 +346,7 @@ class MainWindow(QMainWindow):
         return tab
     
     def create_phase2_tab(self) -> QWidget:
-        """Crea il tab per la Fase 2 (Verifica)"""
+        """Crea il tab per la Fase 2 (Verifica) - AUTONOMO con caricamento file"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setSpacing(10)
@@ -354,15 +355,30 @@ class MainWindow(QMainWindow):
         controls = QGroupBox("Configurazione Verifica")
         controls_layout = QVBoxLayout(controls)
         
+        # Riga file input (output della Fase 1)
+        file_row = QHBoxLayout()
+        file_row.addWidget(QLabel("📁 File Input (output Fase 1):"))
+        self.p2_file_label = QLabel("Nessun file caricato")
+        self.p2_file_label.setStyleSheet("color: #666666; font-style: italic;")
+        file_row.addWidget(self.p2_file_label, stretch=1)
+        
+        self.p2_load_btn = QPushButton("Carica File")
+        self.p2_load_btn.setObjectName("secondaryButton")
+        self.p2_load_btn.clicked.connect(self.load_phase2_file)
+        file_row.addWidget(self.p2_load_btn)
+        controls_layout.addLayout(file_row)
+        
+        # Info dispositivi caricati
         info_row = QHBoxLayout()
-        self.p2_info_label = QLabel("⚠️ Esegui prima la Fase 1 per avere dispositivi da verificare")
-        self.p2_info_label.setStyleSheet("color: #996600; font-weight: bold;")
+        self.p2_info_label = QLabel("ℹ️ Carica il file Excel prodotto dalla Fase 1")
+        self.p2_info_label.setStyleSheet("color: #666666;")
         info_row.addWidget(self.p2_info_label)
         info_row.addStretch()
-        self.p2_count_label = QLabel("Dispositivi OK da verificare: 0")
+        self.p2_count_label = QLabel("Dispositivi da verificare: 0")
         info_row.addWidget(self.p2_count_label)
         controls_layout.addLayout(info_row)
         
+        # Azioni
         actions_row = QHBoxLayout()
         actions_row.addStretch()
         
@@ -399,13 +415,13 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.p2_export_btn)
         layout.addWidget(progress_widget)
         
-        # Tabella
+        # Tabella - aggiorno colonne per mostrare data_datetime
         table_group = QGroupBox("Risultati Verifica")
         table_layout = QVBoxLayout(table_group)
         
         self.p2_table = QTableWidget()
         self.p2_table.setColumnCount(10)
-        self.p2_table.setHorizontalHeaderLabels(["Stato", "DeviceID", "Tipo", "Allarme", "Inc X", "Inc Y", "TS OK", "Delta", "Reset Time", "Note"])
+        self.p2_table.setHorizontalHeaderLabels(["Stato", "DeviceID", "Tipo", "Allarme", "Inc X", "Inc Y", "TS OK", "Delta", "Data Time", "Note"])
         self.p2_table.setAlternatingRowColors(True)
         self.p2_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.p2_table.setSortingEnabled(True)
@@ -621,15 +637,11 @@ class MainWindow(QMainWindow):
         self.log_p1(f"Fase 1 completata: {ok_count} OK, {ko_count} KO", "OK" if ko_count == 0 else "WARN")
         self.status_label.setText(f"Fase 1 completata: {ok_count} OK, {ko_count} problemi")
         
-        ok_results = [r for r in results if r.reset_inclinometro == "OK"]
-        if ok_results:
-            self.p2_info_label.setText(f"✓ {len(ok_results)} dispositivi pronti per la verifica")
-            self.p2_info_label.setStyleSheet("color: #009933; font-weight: bold;")
-            self.p2_count_label.setText(f"Dispositivi OK da verificare: {len(ok_results)}")
-            self.p2_start_btn.setEnabled(True)
-        
+        # Fase 2 è ora autonoma - non abilitiamo nulla qui
         QMessageBox.information(self, "Fase 1 Completata",
-            f"Reset completato per {len(results)} dispositivi.\n\n✅ OK: {ok_count}\n❌ Problemi: {ko_count}")
+            f"Reset completato per {len(results)} dispositivi.\n\n"
+            f"✅ OK: {ok_count}\n❌ Problemi: {ko_count}\n\n"
+            f"Esporta i risultati per usarli nella Fase 2.")
     
     def export_phase1(self):
         if not self.reset_results:
@@ -650,13 +662,42 @@ class MainWindow(QMainWindow):
     
     # ========== FASE 2 ==========
     
-    def start_phase2(self):
-        ok_results = [r for r in self.reset_results if r.reset_inclinometro == "OK" and r.reset_timestamp]
-        if not ok_results:
-            QMessageBox.warning(self, "Errore", "Nessun dispositivo con reset OK da verificare")
+    def load_phase2_file(self):
+        """Carica il file Excel per la Fase 2 (output della Fase 1)"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Seleziona File Fase 1 (Output Reset)", 
+            "", "Excel Files (*.xlsx *.xls);;All Files (*)"
+        )
+        if not file_path:
             return
         
-        devices_to_verify = [{"deviceid": r.deviceid, "reset_timestamp": r.reset_timestamp, "tipo": r.tipo} for r in ok_results]
+        success, msg, count = self.phase2_loader.load_file(file_path)
+        if success:
+            self.p2_file_label.setText(f"✓ {Path(file_path).name}")
+            self.p2_file_label.setStyleSheet("color: #009933;")
+            self.p2_start_btn.setEnabled(count > 0)
+            self.p2_info_label.setText(f"✓ {msg}")
+            self.p2_info_label.setStyleSheet("color: #009933;")
+            self.p2_count_label.setText(f"Dispositivi da verificare: {count}")
+            self.log_p2(f"File caricato: {msg}", "OK")
+            
+            summary = self.phase2_loader.get_summary()
+            master_count = summary.get('master', 0)
+            slave_count = summary.get('slave', 0)
+            self.log_p2(f"Master: {master_count} | Slave: {slave_count}", "INFO")
+            self.status_label.setText(f"Fase 2: {count} dispositivi pronti per la verifica")
+        else:
+            QMessageBox.warning(self, "Errore", msg)
+            self.log_p2(msg, "ERROR")
+            self.p2_start_btn.setEnabled(False)
+    
+    def start_phase2(self):
+        """Avvia la Fase 2 - usa i dati caricati da file"""
+        devices_to_verify = self.phase2_loader.get_devices()
+        
+        if not devices_to_verify:
+            QMessageBox.warning(self, "Errore", "Nessun dispositivo da verificare.\nCarica prima un file con i risultati della Fase 1.")
+            return
         
         reply = QMessageBox.question(self, "Conferma Verifica",
             f"Avviare la verifica per {len(devices_to_verify)} dispositivi?\n\n"
@@ -666,6 +707,16 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         
+        # Verifica autenticazione
+        tm = get_token_manager()
+        success, msg = tm.validate_config()
+        if not success:
+            QMessageBox.critical(self, "Errore Autenticazione", msg)
+            self.log_p2(msg, "ERROR")
+            return
+        
+        self.log_p2("Autenticazione OK", "OK")
+        
         self.verify_results = []
         self.p2_table.setRowCount(0)
         self.p2_progress.setMaximum(len(devices_to_verify))
@@ -674,6 +725,7 @@ class MainWindow(QMainWindow):
         self.p2_start_btn.setEnabled(False)
         self.p2_stop_btn.setEnabled(True)
         self.p2_export_btn.setEnabled(False)
+        self.p2_load_btn.setEnabled(False)
         
         for device in devices_to_verify:
             self.add_verify_row(device)
@@ -706,9 +758,7 @@ class MainWindow(QMainWindow):
         for col in range(3, 10):
             self.p2_table.setItem(row, col, QTableWidgetItem("-"))
         
-        if device.get("reset_timestamp"):
-            reset_dt = datetime.fromtimestamp(device["reset_timestamp"] / 1000).strftime("%Y-%m-%d %H:%M:%S")
-            self.p2_table.item(row, 8).setText(reset_dt)
+        # La colonna 8 "Data Time" verrà popolata dopo la verifica con data_datetime
     
     def update_verify_row(self, result: VerifyResult):
         for row in range(self.p2_table.rowCount()):
@@ -750,6 +800,9 @@ class MainWindow(QMainWindow):
                 # Delta
                 self.p2_table.item(row, 7).setText(result.timestamp_delta_readable)
                 
+                # Data Time (timestamp dal pacchetto API, non più reset_datetime)
+                self.p2_table.item(row, 8).setText(result.data_datetime if result.data_datetime else "-")
+                
                 # Note
                 self.p2_table.item(row, 9).setText(result.error_message)
                 break
@@ -772,6 +825,7 @@ class MainWindow(QMainWindow):
         self.p2_start_btn.setEnabled(True)
         self.p2_stop_btn.setEnabled(False)
         self.p2_export_btn.setEnabled(True)
+        self.p2_load_btn.setEnabled(True)  # Riabilita caricamento file
         
         verified_count = sum(1 for r in results if r.all_ok)
         problem_count = len(results) - verified_count

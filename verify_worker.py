@@ -39,13 +39,12 @@ class VerifyResult:
     deviceid: str
     tipo: str = "unknown"
     
-    # Timestamp del reset originale
+    # Timestamp del reset originale (input)
     reset_timestamp: Optional[int] = None
-    reset_datetime: str = ""
     
-    # Timestamp della verifica
-    verify_timestamp: Optional[int] = None
-    verify_datetime: str = ""
+    # Timestamp dei dati dal pacchetto API (quello di ALG_Digil2_Alm_Incl)
+    data_timestamp: Optional[int] = None
+    data_datetime: str = ""  # Human readable
     
     # Dati dall'API
     alarm_incl: Optional[bool] = None
@@ -76,9 +75,8 @@ class VerifyResult:
             "deviceid": self.deviceid,
             "tipo": self.tipo,
             "reset_timestamp": self.reset_timestamp,
-            "reset_datetime": self.reset_datetime,
-            "verify_timestamp": self.verify_timestamp,
-            "verify_datetime": self.verify_datetime,
+            "data_timestamp": self.data_timestamp,
+            "data_datetime": self.data_datetime,
             "alarm_incl": self.alarm_incl,
             "alarm_ok": "OK" if self.alarm_ok else "KO",
             "inc_x_avg": self.inc_x_avg,
@@ -172,7 +170,6 @@ class VerifyWorker:
         result = VerifyResult(deviceid=deviceid)
         result.tipo = tipo
         result.reset_timestamp = reset_timestamp
-        result.reset_datetime = datetime.fromtimestamp(reset_timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S")
         result.status = VerifyStatus.IN_PROGRESS
         
         self._update_stats("in_progress")
@@ -187,12 +184,6 @@ class VerifyWorker:
             self.tolerance
         )
         
-        # Popola il risultato
-        result.verify_timestamp = verify_data.get("verify_timestamp")
-        result.verify_datetime = datetime.fromtimestamp(
-            result.verify_timestamp / 1000
-        ).strftime("%Y-%m-%d %H:%M:%S") if result.verify_timestamp else ""
-        
         # Dati dall'API
         result.alarm_incl = verify_data.get("alarm_incl")
         result.alarm_incl_timestamp = verify_data.get("alarm_incl_timestamp")
@@ -200,6 +191,14 @@ class VerifyWorker:
         result.inc_x_timestamp = verify_data.get("inc_x_timestamp")
         result.inc_y_avg = verify_data.get("inc_y_avg")
         result.inc_y_timestamp = verify_data.get("inc_y_timestamp")
+        
+        # Usa il timestamp di ALG_Digil2_Alm_Incl come data_timestamp
+        # (in teoria i 3 timestamp dovrebbero essere uguali)
+        result.data_timestamp = result.alarm_incl_timestamp
+        if result.data_timestamp:
+            result.data_datetime = datetime.fromtimestamp(
+                result.data_timestamp / 1000
+            ).strftime("%Y-%m-%d %H:%M:%S")
         
         # Risultati check
         result.alarm_ok = verify_data.get("alarm_ok", False)
