@@ -367,7 +367,7 @@ class ResultExporter:
         - inc_x_avg, inc_x_ok
         - inc_y_avg, inc_y_ok
         - timestamp_valid, timestamp_delta_readable
-        - reset_timestamp, data_timestamp, data_datetime
+        - reset_datetime, data_datetime (date leggibili, non timestamp ms)
         - status, error_message
         """
         if not results:
@@ -382,14 +382,14 @@ class ResultExporter:
             data = [r.to_dict() for r in results]
             df = pd.DataFrame(data)
             
-            # Riordina colonne - NUOVA STRUTTURA
+            # Riordina colonne - STRUTTURA AGGIORNATA (date leggibili, no timestamp ms)
             col_order = [
                 "deviceid", "tipo", "all_ok",
                 "alarm_incl", "alarm_ok",
                 "inc_x_avg", "inc_x_ok",
                 "inc_y_avg", "inc_y_ok",
                 "timestamp_valid", "timestamp_delta_readable",
-                "reset_timestamp", "data_timestamp", "data_datetime",
+                "reset_datetime", "data_datetime",
                 "status", "error_message"
             ]
             df = df[[c for c in col_order if c in df.columns]]
@@ -430,10 +430,9 @@ class ResultExporter:
                 worksheet.set_column(1, 1, 8)    # tipo
                 worksheet.set_column(2, 2, 8)    # all_ok
                 worksheet.set_column(3, 10, 12)  # check columns
-                worksheet.set_column(11, 12, 18) # timestamps
-                worksheet.set_column(13, 13, 20) # data_datetime
-                worksheet.set_column(14, 14, 15) # status
-                worksheet.set_column(15, 15, 30) # error
+                worksheet.set_column(11, 12, 20) # reset_datetime, data_datetime
+                worksheet.set_column(13, 13, 15) # status
+                worksheet.set_column(14, 14, 40) # error_message
                 
                 # Formattazione condizionale per all_ok (colonna C, index 2)
                 worksheet.conditional_format(1, 2, len(df), 2, {

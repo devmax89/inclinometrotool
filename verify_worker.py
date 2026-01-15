@@ -71,12 +71,18 @@ class VerifyResult:
     
     def to_dict(self) -> Dict:
         """Converte in dizionario per export"""
+        # Converti reset_timestamp in data leggibile
+        reset_datetime = ""
+        if self.reset_timestamp:
+            try:
+                reset_datetime = datetime.fromtimestamp(self.reset_timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                reset_datetime = ""
+        
         return {
             "deviceid": self.deviceid,
             "tipo": self.tipo,
-            "reset_timestamp": self.reset_timestamp,
-            "data_timestamp": self.data_timestamp,
-            "data_datetime": self.data_datetime,
+            "all_ok": "OK" if self.all_ok else "KO",
             "alarm_incl": self.alarm_incl,
             "alarm_ok": "OK" if self.alarm_ok else "KO",
             "inc_x_avg": self.inc_x_avg,
@@ -84,10 +90,10 @@ class VerifyResult:
             "inc_y_avg": self.inc_y_avg,
             "inc_y_ok": "OK" if self.inc_y_ok else "KO",
             "timestamp_valid": "OK" if self.timestamp_valid else "KO",
-            "timestamp_delta_ms": self.timestamp_delta_ms,
             "timestamp_delta_readable": self.timestamp_delta_readable,
+            "reset_datetime": reset_datetime,
+            "data_datetime": self.data_datetime,
             "status": self.status.value,
-            "all_ok": "OK" if self.all_ok else "KO",
             "error_message": self.error_message
         }
 
@@ -224,13 +230,22 @@ class VerifyWorker:
             # Determina il motivo del fallimento
             issues = []
             if not result.alarm_ok:
-                issues.append("Allarme attivo")
+                if result.alarm_incl is not None:
+                    issues.append(f"Allarme attivo")
+                else:
+                    issues.append("Allarme: nessun dato")
             if not result.inc_x_ok:
-                issues.append(f"Inc X={result.inc_x_avg:.3f}")
+                if result.inc_x_avg is not None:
+                    issues.append(f"Inc X={result.inc_x_avg:.3f}")
+                else:
+                    issues.append("Inc X: nessun dato")
             if not result.inc_y_ok:
-                issues.append(f"Inc Y={result.inc_y_avg:.3f}")
+                if result.inc_y_avg is not None:
+                    issues.append(f"Inc Y={result.inc_y_avg:.3f}")
+                else:
+                    issues.append("Inc Y: nessun dato")
             if not result.timestamp_valid:
-                issues.append("Dati vecchi")
+                issues.append("Dati vecchi o mancanti")
             
             result.error_message = "; ".join(issues)
             
