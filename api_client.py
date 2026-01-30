@@ -132,6 +132,61 @@ class DIGILApiClient:
             "Accept": "application/json"
         }
     
+    def send_command_no_retry(self, deviceid: str, payload: Dict[str, Any],
+                               timeout: int = 60) -> Tuple[str, Optional[int], str]:
+        """
+        Invia un comando a un dispositivo SENZA retry (fire and forget).
+        Una sola chiamata, ritorna immediatamente.
+        
+        Args:
+            deviceid: ID del dispositivo
+            payload: Payload del comando
+            timeout: Timeout in secondi per la singola richiesta
+            
+        Returns:
+            (status, timestamp_success, error_message)
+            - status: "OK" se successo, "ERRORE" altrimenti
+            - timestamp_success: timestamp in ms se OK, None altrimenti
+            - error_message: descrizione errore se fallito, "" se OK
+        """
+        url = self.cmd_url.format(deviceid=deviceid)
+        
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=self._get_headers(),
+                verify=False,
+                timeout=timeout
+            )
+            
+            # Token scaduto/invalido - riprova una volta con nuovo token
+            if response.status_code in [401, 403]:
+                self.token_manager.invalidate()
+                response = requests.post(
+                    url,
+                    json=payload,
+                    headers=self._get_headers(),
+                    verify=False,
+                    timeout=timeout
+                )
+            
+            response.raise_for_status()
+            
+            # Successo! Registra il timestamp in millisecondi
+            success_timestamp = int(time.time() * 1000)
+            return ("OK", success_timestamp, "")
+            
+        except requests.exceptions.Timeout:
+            return ("ERRORE", None, "Timeout richiesta")
+        except requests.exceptions.ConnectionError:
+            return ("ERRORE", None, "Connessione fallita")
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response else "N/A"
+            return ("ERRORE", None, f"HTTP {status_code}")
+        except Exception as e:
+            return ("ERRORE", None, str(e))
+    
     def send_command(self, deviceid: str, payload: Dict[str, Any], 
                      max_minutes: int = 10,
                      progress_callback=None) -> Tuple[str, int, Optional[int]]:

@@ -2,6 +2,10 @@
 DIGIL Reset Inclinometro - Reset Worker (Fase 1)
 ================================================
 Gestisce l'esecuzione del reset inclinometro sui dispositivi DIGIL.
+
+Due modalità operative:
+- QUICK MODE (default): Invio sequenziale dei comandi senza retry/verifica
+- VERIFY MODE: Invio con retry e attesa conferma (modalità precedente)
 """
 
 import threading
@@ -27,6 +31,7 @@ class ResetStatus(Enum):
     FAILED = "Fallito"
     SKIPPED = "Skipped"
     ERROR = "Errore"
+    PARTIAL = "Parziale"  # Alcuni comandi OK, altri KO
 
 
 @dataclass
@@ -46,11 +51,19 @@ class ResetResult:
     # Timestamp human-readable
     reset_datetime: str = ""
     
-    # Errori
+    # Errori dettagliati per ogni fase
+    error_maint_on: str = ""
+    error_reset: str = ""
+    error_maint_off: str = ""
+    
+    # Errore complessivo
     error_message: str = ""
     
     # Status complessivo
     status: ResetStatus = ResetStatus.PENDING
+    
+    # Modalità usata
+    quick_mode: bool = True
     
     def to_dict(self) -> Dict:
         """Converte in dizionario per export"""
@@ -96,10 +109,22 @@ def detect_device_type(deviceid: str) -> str:
 class ResetWorker:
     """
     Worker per eseguire il reset dell'inclinometro su più dispositivi.
+    
+    Supporta due modalità:
+    - quick_mode=True (default): Fire and forget, invia comandi senza retry
+    - quick_mode=False: Con retry e verifica (modalità precedente)
     """
     
-    def __init__(self):
+    def __init__(self, quick_mode: bool = True):
+        """
+        Inizializza il worker.
+        
+        Args:
+            quick_mode: Se True (default), usa modalità rapida senza retry.
+                       Se False, usa modalità con retry e verifica.
+        """
         self.api_client = get_api_client()
+        self.quick_mode = quick_mode
         
         # Configurazione da .env
         self.max_threads = int(os.getenv("MAX_THREADS", "87"))
@@ -117,6 +142,7 @@ class ResetWorker:
             "completed": 0,
             "success": 0,
             "failed": 0,
+            "partial": 0,
             "in_progress": 0
         }
         self._stats_lock = threading.Lock()
@@ -134,6 +160,7 @@ class ResetWorker:
             "completed": 0,
             "success": 0,
             "failed": 0,
+            "partial": 0,
             "in_progress": 0
         }
     
@@ -142,10 +169,13 @@ class ResetWorker:
         with self._stats_lock:
             self.stats[field] += delta
     
-    def _process_single_device(self, deviceid: str,
-                                progress_callback: Optional[Callable] = None) -> ResetResult:
+    def _process_single_device_quick(self, deviceid: str,
+                                      progress_callback: Optional[Callable] = None) -> ResetResult:
         """
-        Processa un singolo dispositivo.
+        Processa un singolo dispositivo in MODALITÀ RAPIDA (fire and forget).
+        
+        Invia i 3 comandi in sequenza senza attendere conferma/retry.
+        Se un comando fallisce, registra l'errore ma CONTINUA con il successivo.
         
         Fasi:
         1. Manutenzione ON
@@ -155,6 +185,142 @@ class ResetWorker:
         result = ResetResult(deviceid=deviceid)
         result.tipo = detect_device_type(deviceid)
         result.status = ResetStatus.IN_PROGRESS
+        result.quick_mode = True
+        
+        self._update_stats("in_progress")
+        
+        errors = []
+        successes = 0
+        
+        # === FASE 1: Manutenzione ON ===
+        if self._stop_flag.is_set():
+            result.status = ResetStatus.FAILED
+            result.error_message = "Interrotto"
+            self._update_stats("in_progress", -1)
+            self._update_stats("failed")
+            self._update_stats("completed")
+            return result
+        
+        if progress_callback:
+            progress_callback(result, "Manutenzione ON...")
+        
+        status, timestamp, error = self.api_client.send_command_no_retry(
+            deviceid,
+            {"name": "maintenance", "params": {"status": {"values": ["ON"]}}}
+        )
+        result.manutenzione_on = status
+        result.error_maint_on = error
+        
+        if status == "OK":
+            successes += 1
+        else:
+            errors.append(f"Maint ON: {error}")
+        
+        # === FASE 2: Reset Inclinometro ===
+        if self._stop_flag.is_set():
+            result.manutenzione_off = "INTERROTTO"
+            result.reset_inclinometro = "INTERROTTO"
+            result.status = ResetStatus.FAILED
+            result.error_message = "Interrotto"
+            self._update_stats("in_progress", -1)
+            self._update_stats("failed")
+            self._update_stats("completed")
+            return result
+        
+        if progress_callback:
+            progress_callback(result, "Reset inclinometro...")
+        
+        status, timestamp, error = self.api_client.send_command_no_retry(
+            deviceid,
+            {
+                "name": "set_value",
+                "params": {
+                    "peripheral": {"values": ["sjb"]},
+                    "param": {"values": ["COM_Digil2_Conf_Incl_Taratura"]},
+                    "value": {"values": ["1"]}
+                }
+            }
+        )
+        result.reset_inclinometro = status
+        result.error_reset = error
+        
+        if status == "OK":
+            successes += 1
+            if timestamp:
+                result.reset_timestamp = timestamp
+                result.reset_datetime = datetime.fromtimestamp(timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            errors.append(f"Reset: {error}")
+        
+        # === FASE 3: Manutenzione OFF (sempre eseguita) ===
+        if self._stop_flag.is_set():
+            result.manutenzione_off = "INTERROTTO"
+            result.status = ResetStatus.FAILED
+            result.error_message = "Interrotto"
+            self._update_stats("in_progress", -1)
+            self._update_stats("failed")
+            self._update_stats("completed")
+            return result
+        
+        if progress_callback:
+            progress_callback(result, "Manutenzione OFF...")
+        
+        status, timestamp, error = self.api_client.send_command_no_retry(
+            deviceid,
+            {"name": "maintenance", "params": {"status": {"values": ["OFF"]}}}
+        )
+        result.manutenzione_off = status
+        result.error_maint_off = error
+        
+        if status == "OK":
+            successes += 1
+        else:
+            errors.append(f"Maint OFF: {error}")
+        
+        # === Determina status finale ===
+        if successes == 3:
+            result.status = ResetStatus.OK
+            self._update_stats("success")
+        elif successes == 0:
+            result.status = ResetStatus.FAILED
+            result.error_message = "; ".join(errors)
+            self._update_stats("failed")
+        else:
+            # Parziale: alcuni comandi OK, altri KO
+            result.status = ResetStatus.PARTIAL
+            result.error_message = "; ".join(errors)
+            self._update_stats("partial")
+        
+        self._update_stats("in_progress", -1)
+        self._update_stats("completed")
+        
+        if progress_callback:
+            if result.status == ResetStatus.OK:
+                status_text = "✓ Completato"
+            elif result.status == ResetStatus.PARTIAL:
+                status_text = f"⚠ Parziale: {result.error_message}"
+            else:
+                status_text = f"✗ {result.error_message}"
+            progress_callback(result, status_text)
+        
+        return result
+    
+    def _process_single_device_with_retry(self, deviceid: str,
+                                           progress_callback: Optional[Callable] = None) -> ResetResult:
+        """
+        Processa un singolo dispositivo in MODALITÀ CON VERIFICA (con retry).
+        
+        Questa è la logica originale che attende conferma per ogni comando.
+        
+        Fasi:
+        1. Manutenzione ON (con retry)
+        2. Reset inclinometro (con retry)
+        3. Manutenzione OFF (con retry)
+        """
+        result = ResetResult(deviceid=deviceid)
+        result.tipo = detect_device_type(deviceid)
+        result.status = ResetStatus.IN_PROGRESS
+        result.quick_mode = False
         
         # Timeout basato sul tipo
         max_minutes = self.master_timeout if result.tipo == "master" else self.slave_timeout
@@ -167,7 +333,7 @@ class ResetWorker:
         
         # === FASE 1: Manutenzione ON ===
         if progress_callback:
-            progress_callback(result, "Manutenzione ON...")
+            progress_callback(result, "Manutenzione ON (con verifica)...")
         
         status, attempts, _ = self.api_client.send_command(
             deviceid,
@@ -198,7 +364,7 @@ class ResetWorker:
             return result
         
         if progress_callback:
-            progress_callback(result, "Reset inclinometro...")
+            progress_callback(result, "Reset inclinometro (con verifica)...")
         
         status, attempts, timestamp = self.api_client.send_command(
             deviceid,
@@ -222,7 +388,7 @@ class ResetWorker:
         
         # === FASE 3: Manutenzione OFF (sempre tentata) ===
         if progress_callback:
-            progress_callback(result, "Manutenzione OFF...")
+            progress_callback(result, "Manutenzione OFF (con verifica)...")
         
         status, attempts, _ = self.api_client.send_command(
             deviceid,
@@ -249,6 +415,17 @@ class ResetWorker:
             progress_callback(result, status_text)
         
         return result
+    
+    def _process_single_device(self, deviceid: str,
+                                progress_callback: Optional[Callable] = None) -> ResetResult:
+        """
+        Processa un singolo dispositivo.
+        Seleziona automaticamente la modalità in base a self.quick_mode.
+        """
+        if self.quick_mode:
+            return self._process_single_device_quick(deviceid, progress_callback)
+        else:
+            return self._process_single_device_with_retry(deviceid, progress_callback)
     
     def run(self, device_ids: List[str],
             progress_callback: Optional[Callable] = None,
@@ -350,12 +527,19 @@ if __name__ == "__main__":
     print("Test ResetWorker")
     print("=" * 50)
     
-    worker = ResetWorker()
-    print(f"Max threads: {worker.max_threads}")
-    print(f"Master timeout: {worker.master_timeout} min")
-    print(f"Slave timeout: {worker.slave_timeout} min")
+    # Test modalità quick (default)
+    worker_quick = ResetWorker(quick_mode=True)
+    print(f"Quick mode: {worker_quick.quick_mode}")
+    print(f"Max threads: {worker_quick.max_threads}")
+    
+    # Test modalità con verifica
+    worker_verify = ResetWorker(quick_mode=False)
+    print(f"\nVerify mode: {not worker_verify.quick_mode}")
+    print(f"Master timeout: {worker_verify.master_timeout} min")
+    print(f"Slave timeout: {worker_verify.slave_timeout} min")
     
     # Test detect_device_type
+    print("\nTest detect_device_type:")
     test_ids = ["1121621_0436", "1121525_0103", "1121622_0399"]
     for did in test_ids:
         print(f"{did} -> {detect_device_type(did)}")

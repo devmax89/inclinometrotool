@@ -6,7 +6,9 @@ Tool per il reset e la verifica dell'inclinometro sui dispositivi DIGIL.
 Fase 1: Reset inclinometro con manutenzione ON/OFF
 Fase 2: Verifica che allarme sia false e inclinazioni ~0
 
-Versione: 1.0.0
+Versione: 1.1.0
+- Aggiunta modalità rapida (default) senza retry
+- Modalità con verifica disponibile tramite checkbox
 """
 
 import sys
@@ -20,7 +22,7 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QProgressBar,
     QSpinBox, QGroupBox, QFileDialog, QMessageBox, QTabWidget,
     QHeaderView, QAbstractItemView, QStatusBar, QFrame,
-    QTextEdit
+    QTextEdit, QCheckBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QPixmap
@@ -90,6 +92,15 @@ QTabBar::tab {
 }
 QTabBar::tab:selected { background-color: #0066CC; color: white; }
 QTabBar::tab:hover:!selected { background-color: #E6F2FF; }
+
+QCheckBox { spacing: 8px; }
+QCheckBox::indicator { width: 18px; height: 18px; }
+QCheckBox::indicator:unchecked { 
+    border: 2px solid #CCCCCC; border-radius: 3px; background-color: white; 
+}
+QCheckBox::indicator:checked { 
+    border: 2px solid #0066CC; border-radius: 3px; background-color: #0066CC; 
+}
 """
 
 
@@ -104,10 +115,11 @@ class ResetThread(QThread):
     completed_signal = pyqtSignal(list)
     stats_signal = pyqtSignal(dict)
     
-    def __init__(self, device_ids: List[str]):
+    def __init__(self, device_ids: List[str], quick_mode: bool = True):
         super().__init__()
         self.device_ids = device_ids
-        self.worker = ResetWorker()
+        self.quick_mode = quick_mode
+        self.worker = ResetWorker(quick_mode=quick_mode)
     
     def run(self):
         def on_progress(result, message):
@@ -239,7 +251,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(title_widget)
         layout.addStretch()
         
-        version = QLabel("v1.0.0")
+        version = QLabel("v1.1.0")
         version.setStyleSheet("color: #999999; font-size: 11px;")
         layout.addWidget(version)
         
@@ -255,6 +267,7 @@ class MainWindow(QMainWindow):
         controls = QGroupBox("Configurazione Reset")
         controls_layout = QVBoxLayout(controls)
         
+        # Riga file
         file_row = QHBoxLayout()
         file_row.addWidget(QLabel("📁 File Input:"))
         self.p1_file_label = QLabel("Nessun file caricato")
@@ -267,12 +280,27 @@ class MainWindow(QMainWindow):
         file_row.addWidget(self.p1_load_btn)
         controls_layout.addLayout(file_row)
         
+        # Riga opzioni
         options_row = QHBoxLayout()
         options_row.addWidget(QLabel("Thread paralleli:"))
         self.p1_threads_spin = QSpinBox()
         self.p1_threads_spin.setRange(1, 100)
         self.p1_threads_spin.setValue(87)
         options_row.addWidget(self.p1_threads_spin)
+        
+        # Separator
+        options_row.addSpacing(30)
+        
+        # Checkbox modalità verifica
+        self.p1_verify_mode_cb = QCheckBox("Modalità con verifica (più lenta)")
+        self.p1_verify_mode_cb.setChecked(False)  # Default: modalità rapida
+        self.p1_verify_mode_cb.setToolTip(
+            "Se attivata, ogni comando attende conferma con retry (10-20 min per device).\n"
+            "Se disattivata (default), i comandi vengono inviati in sequenza senza attendere."
+        )
+        self.p1_verify_mode_cb.stateChanged.connect(self.on_verify_mode_changed)
+        options_row.addWidget(self.p1_verify_mode_cb)
+        
         options_row.addStretch()
         
         self.p1_start_btn = QPushButton("▶ Avvia Reset")
@@ -286,6 +314,12 @@ class MainWindow(QMainWindow):
         self.p1_stop_btn.setEnabled(False)
         options_row.addWidget(self.p1_stop_btn)
         controls_layout.addLayout(options_row)
+        
+        # Info modalità
+        self.p1_mode_info = QLabel("ℹ️ Modalità rapida: i comandi vengono inviati senza attendere conferma")
+        self.p1_mode_info.setStyleSheet("color: #0066CC; font-style: italic; margin-top: 5px;")
+        controls_layout.addWidget(self.p1_mode_info)
+        
         layout.addWidget(controls)
         
         # Progress
@@ -297,7 +331,7 @@ class MainWindow(QMainWindow):
         self.p1_progress.setFormat("%v / %m (%p%)")
         progress_layout.addWidget(self.p1_progress, stretch=3)
         
-        self.p1_stats_label = QLabel("OK: 0 | KO: 0 | In corso: 0")
+        self.p1_stats_label = QLabel("OK: 0 | KO: 0 | Parziali: 0 | In corso: 0")
         self.p1_stats_label.setStyleSheet("color: #666666; margin-left: 20px;")
         progress_layout.addWidget(self.p1_stats_label)
         
@@ -415,7 +449,7 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.p2_export_btn)
         layout.addWidget(progress_widget)
         
-        # Tabella - aggiorno colonne per mostrare data_datetime
+        # Tabella
         table_group = QGroupBox("Risultati Verifica")
         table_layout = QVBoxLayout(table_group)
         
@@ -460,7 +494,6 @@ class MainWindow(QMainWindow):
     
     def load_logo(self):
         """Carica il logo Terna dalla cartella assets"""
-        # Percorsi possibili per il logo
         script_dir = Path(__file__).parent
         possible_paths = [
             script_dir / "assets" / "logo_terna.png",
@@ -486,6 +519,15 @@ class MainWindow(QMainWindow):
                     print(f"Errore caricamento logo da {path}: {e}")
         
         print("Logo non trovato - usando placeholder")
+    
+    def on_verify_mode_changed(self, state):
+        """Callback quando cambia la checkbox modalità verifica"""
+        if state == Qt.Checked:
+            self.p1_mode_info.setText("⚠️ Modalità con verifica: ogni comando attende conferma (più lento, 10-20 min/device)")
+            self.p1_mode_info.setStyleSheet("color: #CC6600; font-style: italic; margin-top: 5px;")
+        else:
+            self.p1_mode_info.setText("ℹ️ Modalità rapida: i comandi vengono inviati senza attendere conferma")
+            self.p1_mode_info.setStyleSheet("color: #0066CC; font-style: italic; margin-top: 5px;")
     
     def log_p1(self, message: str, level: str = "INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -527,8 +569,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Errore", "Nessun dispositivo da processare")
             return
         
+        # Determina modalità
+        quick_mode = not self.p1_verify_mode_cb.isChecked()
+        mode_text = "rapida (senza verifica)" if quick_mode else "con verifica (più lenta)"
+        
         reply = QMessageBox.question(self, "Conferma Reset",
             f"Avviare il reset inclinometro per {len(device_ids)} dispositivi?\n\n"
+            f"Modalità: {mode_text}\n"
             f"Thread paralleli: {self.p1_threads_spin.value()}\n\n"
             "Il processo eseguirà:\n1. Manutenzione ON\n2. Reset inclinometro\n3. Manutenzione OFF",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
@@ -544,6 +591,7 @@ class MainWindow(QMainWindow):
             return
         
         self.log_p1("Autenticazione OK", "OK")
+        self.log_p1(f"Modalità: {mode_text}", "INFO")
         
         self.reset_results = []
         self.p1_table.setRowCount(0)
@@ -554,13 +602,14 @@ class MainWindow(QMainWindow):
         self.p1_stop_btn.setEnabled(True)
         self.p1_export_btn.setEnabled(False)
         self.p1_load_btn.setEnabled(False)
+        self.p1_verify_mode_cb.setEnabled(False)
         
         for did in device_ids:
             self.add_reset_row(did)
         
         self.log_p1(f"Avvio reset per {len(device_ids)} dispositivi...", "INFO")
         
-        self.reset_thread = ResetThread(device_ids)
+        self.reset_thread = ResetThread(device_ids, quick_mode=quick_mode)
         self.reset_thread.progress_signal.connect(self.on_reset_progress)
         self.reset_thread.device_complete_signal.connect(self.on_reset_device_complete)
         self.reset_thread.completed_signal.connect(self.on_reset_completed)
@@ -594,6 +643,8 @@ class MainWindow(QMainWindow):
                     status, color = "✅", QColor("#C6EFCE")
                 elif result.status == ResetStatus.IN_PROGRESS:
                     status, color = "🔄", QColor("#FFEB9C")
+                elif result.status == ResetStatus.PARTIAL:
+                    status, color = "⚠️", QColor("#FFE4B5")
                 elif result.status in [ResetStatus.FAILED, ResetStatus.ERROR]:
                     status, color = "❌", QColor("#FFC7CE")
                 else:
@@ -605,9 +656,28 @@ class MainWindow(QMainWindow):
                     if cell:
                         cell.setBackground(color)
                 
-                self.p1_table.item(row, 3).setText(result.manutenzione_on)
-                self.p1_table.item(row, 4).setText(result.reset_inclinometro)
-                self.p1_table.item(row, 5).setText(result.manutenzione_off)
+                # Colora singole celle in base al loro stato
+                maint_on_item = self.p1_table.item(row, 3)
+                maint_on_item.setText(result.manutenzione_on)
+                if result.manutenzione_on == "OK":
+                    maint_on_item.setBackground(QColor("#C6EFCE"))
+                elif result.manutenzione_on not in ["NON ESEGUITO", "-"]:
+                    maint_on_item.setBackground(QColor("#FFC7CE"))
+                
+                reset_item = self.p1_table.item(row, 4)
+                reset_item.setText(result.reset_inclinometro)
+                if result.reset_inclinometro == "OK":
+                    reset_item.setBackground(QColor("#C6EFCE"))
+                elif result.reset_inclinometro not in ["NON ESEGUITO", "-", "SKIPPED"]:
+                    reset_item.setBackground(QColor("#FFC7CE"))
+                
+                maint_off_item = self.p1_table.item(row, 5)
+                maint_off_item.setText(result.manutenzione_off)
+                if result.manutenzione_off == "OK":
+                    maint_off_item.setBackground(QColor("#C6EFCE"))
+                elif result.manutenzione_off not in ["NON ESEGUITO", "-", "SKIPPED"]:
+                    maint_off_item.setBackground(QColor("#FFC7CE"))
+                
                 self.p1_table.item(row, 6).setText(result.reset_datetime)
                 break
     
@@ -619,10 +689,17 @@ class MainWindow(QMainWindow):
         self.reset_results.append(result)
         self.update_reset_row(result)
         self.p1_progress.setValue(len(self.reset_results))
-        self.log_p1(f"{result.deviceid}: {result.reset_inclinometro}", "OK" if result.status == ResetStatus.OK else "ERROR")
+        
+        if result.status == ResetStatus.OK:
+            self.log_p1(f"{result.deviceid}: OK", "OK")
+        elif result.status == ResetStatus.PARTIAL:
+            self.log_p1(f"{result.deviceid}: PARZIALE - {result.error_message}", "WARN")
+        else:
+            self.log_p1(f"{result.deviceid}: {result.error_message}", "ERROR")
     
     def on_reset_stats(self, stats: dict):
-        self.p1_stats_label.setText(f"OK: {stats['success']} | KO: {stats['failed']} | In corso: {stats['in_progress']}")
+        partial = stats.get('partial', 0)
+        self.p1_stats_label.setText(f"OK: {stats['success']} | KO: {stats['failed']} | Parziali: {partial} | In corso: {stats['in_progress']}")
     
     def on_reset_completed(self, results: List[ResetResult]):
         self.reset_results = results
@@ -630,17 +707,18 @@ class MainWindow(QMainWindow):
         self.p1_stop_btn.setEnabled(False)
         self.p1_export_btn.setEnabled(True)
         self.p1_load_btn.setEnabled(True)
+        self.p1_verify_mode_cb.setEnabled(True)
         
-        ok_count = sum(1 for r in results if r.reset_inclinometro == "OK")
-        ko_count = len(results) - ok_count
+        ok_count = sum(1 for r in results if r.status == ResetStatus.OK)
+        partial_count = sum(1 for r in results if r.status == ResetStatus.PARTIAL)
+        ko_count = len(results) - ok_count - partial_count
         
-        self.log_p1(f"Fase 1 completata: {ok_count} OK, {ko_count} KO", "OK" if ko_count == 0 else "WARN")
-        self.status_label.setText(f"Fase 1 completata: {ok_count} OK, {ko_count} problemi")
+        self.log_p1(f"Fase 1 completata: {ok_count} OK, {partial_count} parziali, {ko_count} KO", "OK" if ko_count == 0 else "WARN")
+        self.status_label.setText(f"Fase 1 completata: {ok_count} OK, {partial_count} parziali, {ko_count} problemi")
         
-        # Fase 2 è ora autonoma - non abilitiamo nulla qui
         QMessageBox.information(self, "Fase 1 Completata",
             f"Reset completato per {len(results)} dispositivi.\n\n"
-            f"✅ OK: {ok_count}\n❌ Problemi: {ko_count}\n\n"
+            f"✅ OK: {ok_count}\n⚠️ Parziali: {partial_count}\n❌ Problemi: {ko_count}\n\n"
             f"Esporta i risultati per usarli nella Fase 2.")
     
     def export_phase1(self):
@@ -707,7 +785,6 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         
-        # Verifica autenticazione
         tm = get_token_manager()
         success, msg = tm.validate_config()
         if not success:
@@ -757,8 +834,6 @@ class MainWindow(QMainWindow):
         self.p2_table.setItem(row, 2, QTableWidgetItem(device.get("tipo", "")))
         for col in range(3, 10):
             self.p2_table.setItem(row, col, QTableWidgetItem("-"))
-        
-        # La colonna 8 "Data Time" verrà popolata dopo la verifica con data_datetime
     
     def update_verify_row(self, result: VerifyResult):
         for row in range(self.p2_table.rowCount()):
@@ -777,33 +852,24 @@ class MainWindow(QMainWindow):
                     if cell:
                         cell.setBackground(color)
                 
-                # Allarme
                 if result.alarm_incl is not None:
                     alarm_text = "false ✓" if not result.alarm_incl else "true ✗"
                     self.p2_table.item(row, 3).setText(alarm_text)
                     self.p2_table.item(row, 3).setBackground(QColor("#C6EFCE") if result.alarm_ok else QColor("#FFC7CE"))
                 
-                # Inc X
                 if result.inc_x_avg is not None:
                     self.p2_table.item(row, 4).setText(f"{result.inc_x_avg:.3f}")
                     self.p2_table.item(row, 4).setBackground(QColor("#C6EFCE") if result.inc_x_ok else QColor("#FFC7CE"))
                 
-                # Inc Y
                 if result.inc_y_avg is not None:
                     self.p2_table.item(row, 5).setText(f"{result.inc_y_avg:.3f}")
                     self.p2_table.item(row, 5).setBackground(QColor("#C6EFCE") if result.inc_y_ok else QColor("#FFC7CE"))
                 
-                # Timestamp OK
                 self.p2_table.item(row, 6).setText("✓" if result.timestamp_valid else "✗")
                 self.p2_table.item(row, 6).setBackground(QColor("#C6EFCE") if result.timestamp_valid else QColor("#FFC7CE"))
                 
-                # Delta
                 self.p2_table.item(row, 7).setText(result.timestamp_delta_readable)
-                
-                # Data Time (timestamp dal pacchetto API, non più reset_datetime)
                 self.p2_table.item(row, 8).setText(result.data_datetime if result.data_datetime else "-")
-                
-                # Note
                 self.p2_table.item(row, 9).setText(result.error_message)
                 break
     
@@ -825,7 +891,7 @@ class MainWindow(QMainWindow):
         self.p2_start_btn.setEnabled(True)
         self.p2_stop_btn.setEnabled(False)
         self.p2_export_btn.setEnabled(True)
-        self.p2_load_btn.setEnabled(True)  # Riabilita caricamento file
+        self.p2_load_btn.setEnabled(True)
         
         verified_count = sum(1 for r in results if r.all_ok)
         problem_count = len(results) - verified_count
