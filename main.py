@@ -30,6 +30,7 @@ from reset_worker import ResetWorker, ResetResult, ResetStatus, MaintenanceState
 from verify_worker import VerifyWorker, VerifyResult, VerifyStatus
 from data_handler import InputLoader, Phase2InputLoader, ResultExporter
 from api_client import get_token_manager
+from quick_check import QuickCheckWorker, MaintenanceStatusResult, CommandQueueResult
 
 
 TERNA_STYLE = """
@@ -105,6 +106,32 @@ class ResetThread(QThread):
         return self.worker.send_maintenance_off_to_pending(progress_callback)
 
 
+class QuickCheckThread(QThread):
+    """Thread per check rapidi (status e queue)"""
+    progress_signal = pyqtSignal(str, int, int)  # deviceid, index, total
+    completed_signal = pyqtSignal(list, str)  # results, check_type
+    
+    def __init__(self, device_ids: List[str], check_type: str):
+        super().__init__()
+        self.device_ids = device_ids
+        self.check_type = check_type  # "status" o "queue"
+        self.worker = QuickCheckWorker()
+    
+    def run(self):
+        def on_progress(deviceid, index, total):
+            self.progress_signal.emit(deviceid, index, total)
+        
+        if self.check_type == "status":
+            results = self.worker.check_maintenance_status(self.device_ids, on_progress)
+        else:  # queue
+            results = self.worker.check_command_queue(self.device_ids, 24, on_progress)
+        
+        self.completed_signal.emit(results, self.check_type)
+    
+    def stop(self):
+        self.worker.stop()
+
+
 class VerifyThread(QThread):
     progress_signal = pyqtSignal(object, str)
     device_complete_signal = pyqtSignal(object)
@@ -142,6 +169,7 @@ class MainWindow(QMainWindow):
         self.exporter = ResultExporter()
         self.reset_thread: Optional[ResetThread] = None
         self.verify_thread: Optional[VerifyThread] = None
+        self.quick_check_thread: Optional[QuickCheckThread] = None
         self.reset_results: List[ResetResult] = []
         self.verify_results: List[VerifyResult] = []
         self.reset_log_file: Optional[Path] = None
@@ -248,6 +276,30 @@ class MainWindow(QMainWindow):
         info = QLabel("ℹ️ Modalità con verifica commands-log")
         info.setStyleSheet("color: #0066CC; font-style: italic;")
         controls_layout.addWidget(info)
+        
+        # Riga Quick Check
+        quick_check_row = QHBoxLayout()
+        quick_check_label = QLabel("🔍 Quick Check:")
+        quick_check_label.setStyleSheet("font-weight: bold;")
+        quick_check_row.addWidget(quick_check_label)
+        
+        self.p1_check_status_btn = QPushButton("📊 Check Status")
+        self.p1_check_status_btn.setObjectName("secondaryButton")
+        self.p1_check_status_btn.setToolTip("Verifica stato maintenance di tutti i device")
+        self.p1_check_status_btn.clicked.connect(self.quick_check_status)
+        self.p1_check_status_btn.setEnabled(False)
+        quick_check_row.addWidget(self.p1_check_status_btn)
+        
+        self.p1_check_queue_btn = QPushButton("📋 Check Queue")
+        self.p1_check_queue_btn.setObjectName("secondaryButton")
+        self.p1_check_queue_btn.setToolTip("Verifica coda comandi di tutti i device (ultime 24h)")
+        self.p1_check_queue_btn.clicked.connect(self.quick_check_queue)
+        self.p1_check_queue_btn.setEnabled(False)
+        quick_check_row.addWidget(self.p1_check_queue_btn)
+        
+        quick_check_row.addStretch()
+        controls_layout.addLayout(quick_check_row)
+        
         layout.addWidget(controls)
         
         # Progress
@@ -442,6 +494,8 @@ class MainWindow(QMainWindow):
             self.p1_file_label.setText(f"✓ {Path(file_path).name} ({count} dispositivi)")
             self.p1_file_label.setStyleSheet("color: #009933;")
             self.p1_start_btn.setEnabled(True)
+            self.p1_check_status_btn.setEnabled(True)
+            self.p1_check_queue_btn.setEnabled(True)
             self.log_p1(f"File caricato: {count} dispositivi", "OK")
             self.status_label.setText(f"File caricato: {count} dispositivi pronti")
         else:
@@ -742,6 +796,107 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "OK", f"Salvato: {result}")
             else:
                 QMessageBox.critical(self, "Errore", result)
+    
+    # ========== QUICK CHECK ==========
+    
+    def quick_check_status(self):
+        """Verifica stato maintenance di tutti i device"""
+        device_ids = self.input_loader.get_device_ids()
+        if not device_ids:
+            QMessageBox.warning(self, "Errore", "Nessun dispositivo nel file")
+            return
+        
+        # Verifica autenticazione
+        tm = get_token_manager()
+        success, msg = tm.validate_config()
+        if not success:
+            QMessageBox.critical(self, "Errore Autenticazione", msg)
+            return
+        
+        self.log_p1(f"Quick Check Status: {len(device_ids)} dispositivi...", "INFO")
+        self.status_label.setText(f"Check status in corso: 0/{len(device_ids)}")
+        
+        # Disabilita pulsanti durante check
+        self.p1_check_status_btn.setEnabled(False)
+        self.p1_check_queue_btn.setEnabled(False)
+        
+        self.quick_check_thread = QuickCheckThread(device_ids, "status")
+        self.quick_check_thread.progress_signal.connect(self.on_quick_check_progress)
+        self.quick_check_thread.completed_signal.connect(self.on_quick_check_completed)
+        self.quick_check_thread.start()
+    
+    def quick_check_queue(self):
+        """Verifica coda comandi di tutti i device"""
+        device_ids = self.input_loader.get_device_ids()
+        if not device_ids:
+            QMessageBox.warning(self, "Errore", "Nessun dispositivo nel file")
+            return
+        
+        tm = get_token_manager()
+        success, msg = tm.validate_config()
+        if not success:
+            QMessageBox.critical(self, "Errore Autenticazione", msg)
+            return
+        
+        self.log_p1(f"Quick Check Queue: {len(device_ids)} dispositivi (ultime 24h)...", "INFO")
+        self.status_label.setText(f"Check queue in corso: 0/{len(device_ids)}")
+        
+        self.p1_check_status_btn.setEnabled(False)
+        self.p1_check_queue_btn.setEnabled(False)
+        
+        self.quick_check_thread = QuickCheckThread(device_ids, "queue")
+        self.quick_check_thread.progress_signal.connect(self.on_quick_check_progress)
+        self.quick_check_thread.completed_signal.connect(self.on_quick_check_completed)
+        self.quick_check_thread.start()
+    
+    def on_quick_check_progress(self, deviceid: str, index: int, total: int):
+        self.status_label.setText(f"Check in corso: {index+1}/{total} - {deviceid}")
+    
+    def on_quick_check_completed(self, results: List, check_type: str):
+        self.p1_check_status_btn.setEnabled(True)
+        self.p1_check_queue_btn.setEnabled(True)
+        
+        # Genera nome file output
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if check_type == "status":
+            default_name = f"CheckStatus_{timestamp}.xlsx"
+            title = "Salva Check Status"
+        else:
+            default_name = f"CheckQueue_{timestamp}.xlsx"
+            title = "Salva Check Queue"
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, title, 
+            str(Path.home() / "Downloads" / default_name), 
+            "Excel (*.xlsx)"
+        )
+        
+        if file_path:
+            if check_type == "status":
+                success, result = QuickCheckWorker.export_maintenance_status(results, file_path)
+                
+                # Mostra riepilogo
+                on_count = sum(1 for r in results if r.status == "ON")
+                off_count = sum(1 for r in results if r.status == "OFF")
+                null_count = sum(1 for r in results if r.status == "NULL")
+                error_count = sum(1 for r in results if r.status == "ERROR")
+                
+                self.log_p1(f"Check Status completato: ON={on_count}, OFF={off_count}, NULL={null_count}, ERROR={error_count}", "OK")
+            else:
+                success, result = QuickCheckWorker.export_command_queue(results, file_path)
+                
+                with_pending = sum(1 for r in results if len(r.pending_commands) > 0)
+                self.log_p1(f"Check Queue completato: {with_pending} device con comandi pending", "OK")
+            
+            if success:
+                QMessageBox.information(self, "Check Completato", f"File salvato:\n{result}")
+                self.status_label.setText(f"Check completato - File: {Path(result).name}")
+            else:
+                QMessageBox.critical(self, "Errore", result)
+                self.status_label.setText("Errore export check")
+        else:
+            self.status_label.setText("Check completato - Export annullato")
+            self.log_p1("Check completato, export annullato", "WARN")
     
     def closeEvent(self, event):
         running = (self.reset_thread and self.reset_thread.isRunning()) or (self.verify_thread and self.verify_thread.isRunning())

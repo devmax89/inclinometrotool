@@ -291,88 +291,107 @@ class ResetWorker:
             update_progress(message)
             self._global_log(f"{deviceid}: {message}")
         
-        # ===== FASE 1: MAINTENANCE ON =====
-        result.current_phase = ResetPhase.MAINTENANCE_ON_SENDING
-        result.status = ResetStatus.MAINT_ON
+        # ===== CHECK INIZIALE: VERIFICA SE GIA' IN MAINTENANCE =====
+        result.current_phase = ResetPhase.MAINTENANCE_ON_VERIFYING
+        log_and_update(f"[PRE-CHECK] Verifica stato maintenance attuale...")
         
-        maint_on_done = False
-        while not self._stop_flag.is_set() and not maint_on_done:
-            result.maint_on_attempts += 1
-            log_and_update(f"[MAINT ON] Tentativo {result.maint_on_attempts} - Invio comando...")
+        success, maint_status, error = self.api_client.get_maintenance_status(deviceid)
+        if success:
+            log_and_update(f"[PRE-CHECK] maintenanceMode = '{maint_status}'")
+            if maint_status == "ON":
+                result.maintenance_state = MaintenanceState.ON
+                result.manutenzione_on = "GIA' ON"
+                result.has_maintenance_on_pending = True
+                log_and_update(f"[PRE-CHECK] ✓ Device già in maintenance ON, salto fase 1")
+                # Salta direttamente alla fase RESET
+            else:
+                result.maintenance_state = MaintenanceState.OFF if maint_status == "OFF" else MaintenanceState.UNKNOWN
+        else:
+            log_and_update(f"[PRE-CHECK] Errore lettura: {error}, procedo normalmente")
+        
+        # ===== FASE 1: MAINTENANCE ON (solo se non già ON) =====
+        if result.manutenzione_on != "GIA' ON":
+            result.current_phase = ResetPhase.MAINTENANCE_ON_SENDING
+            result.status = ResetStatus.MAINT_ON
             
-            # 1. Invia comando maintenance ON
-            success, error, sent_time = self.api_client.send_command(
-                deviceid, self.MAINTENANCE_ON_PAYLOAD
-            )
-            
-            if not success:
-                log_and_update(f"[MAINT ON] Errore invio: {error}. Riprovo tra 5s...")
-                time.sleep(5)
-                continue
-            
-            log_and_update(f"[MAINT ON] Comando inviato alle {sent_time.strftime('%H:%M:%S')}, attendo {self.check_interval}s...")
-            result.has_maintenance_on_pending = True  # FLAG SETTATO QUI
-            
-            # 2. Attendi e verifica nel commands-log
-            result.current_phase = ResetPhase.MAINTENANCE_ON_CHECKING_LOG
-            time.sleep(self.check_interval)
-            
-            if self._stop_flag.is_set():
-                break
-            
-            # Ciclo di verifica commands-log
-            check_attempts = 0
-            while not self._stop_flag.is_set():
-                check_attempts += 1
-                log_and_update(f"[MAINT ON] Verifica commands-log (check #{check_attempts})...")
+            maint_on_done = False
+            while not self._stop_flag.is_set() and not maint_on_done:
+                result.maint_on_attempts += 1
+                log_and_update(f"[MAINT ON] Tentativo {result.maint_on_attempts} - Invio comando...")
                 
-                cmd_status = self.api_client.check_command_in_log(
-                    deviceid, "maintenance", self.MAINT_ON_MATCH, sent_time
+                # 1. Invia comando maintenance ON
+                success, error, sent_time = self.api_client.send_command(
+                    deviceid, self.MAINTENANCE_ON_PAYLOAD
                 )
                 
-                if cmd_status["error"]:
-                    log_and_update(f"[MAINT ON] Errore check log: {cmd_status['error']}. Riprovo comando...")
-                    break  # Riprova da capo (invio comando)
-                
-                log_and_update(f"[MAINT ON] Log status: {cmd_status['status']} ({cmd_status.get('debug_info', '')})")
-                
-                if cmd_status["status"] == "pending":
-                    log_and_update(f"[MAINT ON] Comando in pending, attendo {self.check_interval}s...")
-                    time.sleep(self.check_interval)
+                if not success:
+                    log_and_update(f"[MAINT ON] Errore invio: {error}. Riprovo tra 5s...")
+                    time.sleep(5)
                     continue
                 
-                if cmd_status["status"] == "sent_ok":
-                    log_and_update(f"[MAINT ON] Comando confermato (response={cmd_status['response_status']})")
+                log_and_update(f"[MAINT ON] Comando inviato alle {sent_time.strftime('%H:%M:%S')}, attendo {self.check_interval}s...")
+                result.has_maintenance_on_pending = True  # FLAG SETTATO QUI
+                
+                # 2. Attendi e verifica nel commands-log
+                result.current_phase = ResetPhase.MAINTENANCE_ON_CHECKING_LOG
+                time.sleep(self.check_interval)
+                
+                if self._stop_flag.is_set():
+                    break
+                
+                # Ciclo di verifica commands-log
+                check_attempts = 0
+                while not self._stop_flag.is_set():
+                    check_attempts += 1
+                    log_and_update(f"[MAINT ON] Verifica commands-log (check #{check_attempts})...")
                     
-                    # 3. Verifica lo stato nel configuration
-                    result.current_phase = ResetPhase.MAINTENANCE_ON_VERIFYING
-                    log_and_update(f"[MAINT ON] Verifica configuration...")
+                    cmd_status = self.api_client.check_command_in_log(
+                        deviceid, "maintenance", self.MAINT_ON_MATCH, sent_time
+                    )
                     
-                    success, maint_status, error = self.api_client.get_maintenance_status(deviceid)
+                    if cmd_status["error"]:
+                        log_and_update(f"[MAINT ON] Errore check log: {cmd_status['error']}. Riprovo comando...")
+                        break  # Riprova da capo (invio comando)
                     
-                    if success:
-                        log_and_update(f"[MAINT ON] Configuration maintenanceMode = '{maint_status}'")
-                        if maint_status == "ON":
-                            result.maintenance_state = MaintenanceState.ON
-                            result.manutenzione_on = "OK"
-                            log_and_update(f"[MAINT ON] ✓ Verificato: maintenanceMode=ON")
-                            maint_on_done = True  # Esce da tutti i loop
-                            break
+                    log_and_update(f"[MAINT ON] Log status: {cmd_status['status']} ({cmd_status.get('debug_info', '')})")
+                    
+                    if cmd_status["status"] == "pending":
+                        log_and_update(f"[MAINT ON] Comando in pending, attendo {self.check_interval}s...")
+                        time.sleep(self.check_interval)
+                        continue
+                    
+                    if cmd_status["status"] == "sent_ok":
+                        log_and_update(f"[MAINT ON] Comando confermato (response={cmd_status['response_status']})")
+                        
+                        # 3. Verifica lo stato nel configuration
+                        result.current_phase = ResetPhase.MAINTENANCE_ON_VERIFYING
+                        log_and_update(f"[MAINT ON] Verifica configuration...")
+                        
+                        success, maint_status, error = self.api_client.get_maintenance_status(deviceid)
+                        
+                        if success:
+                            log_and_update(f"[MAINT ON] Configuration maintenanceMode = '{maint_status}'")
+                            if maint_status == "ON":
+                                result.maintenance_state = MaintenanceState.ON
+                                result.manutenzione_on = "OK"
+                                log_and_update(f"[MAINT ON] ✓ Verificato: maintenanceMode=ON")
+                                maint_on_done = True  # Esce da tutti i loop
+                                break
+                            else:
+                                result.maintenance_state = MaintenanceState.OFF if maint_status == "OFF" else MaintenanceState.UNKNOWN
+                                log_and_update(f"[MAINT ON] Configuration non ancora ON, riprovo...")
                         else:
-                            result.maintenance_state = MaintenanceState.OFF if maint_status == "OFF" else MaintenanceState.UNKNOWN
-                            log_and_update(f"[MAINT ON] Configuration non ancora ON, riprovo...")
-                    else:
-                        log_and_update(f"[MAINT ON] Errore lettura configuration: {error}. Riprovo...")
+                            log_and_update(f"[MAINT ON] Errore lettura configuration: {error}. Riprovo...")
+                        
+                        break  # Riprova da capo
                     
-                    break  # Riprova da capo
-                
-                elif cmd_status["status"] in ["sent_error", "sent_no_response"]:
-                    log_and_update(f"[MAINT ON] Comando fallito (status={cmd_status.get('response_status', 'N/A')}). Riprovo...")
-                    break  # Riprova da capo
-                
-                else:  # not_found
-                    log_and_update(f"[MAINT ON] Comando non trovato nel log. Debug: {cmd_status.get('debug_info', '')}. Riprovo...")
-                    break  # Riprova da capo
+                    elif cmd_status["status"] in ["sent_error", "sent_no_response"]:
+                        log_and_update(f"[MAINT ON] Comando fallito (status={cmd_status.get('response_status', 'N/A')}). Riprovo...")
+                        break  # Riprova da capo
+                    
+                    else:  # not_found
+                        log_and_update(f"[MAINT ON] Comando non trovato nel log. Debug: {cmd_status.get('debug_info', '')}. Riprovo...")
+                        break  # Riprova da capo
         
         if self._stop_flag.is_set():
             result.status = ResetStatus.INTERRUPTED
