@@ -2,6 +2,8 @@
 DIGIL Reset Inclinometro - API Client Module
 =============================================
 Gestisce l'autenticazione OAuth2 e le chiamate API verso il backend DIGIL.
+
+v2.0.0 - Aggiunta logica commands-log e configuration check
 """
 
 import requests
@@ -9,8 +11,8 @@ import urllib3
 import threading
 import time
 import os
-from datetime import datetime
-from typing import Optional, Tuple, Dict, Any
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple, Dict, Any, List
 from dotenv import load_dotenv
 
 # Disabilita warning SSL
@@ -120,8 +122,11 @@ class DIGILApiClient:
     
     def __init__(self, token_manager: TokenManager):
         self.token_manager = token_manager
-        self.cmd_url = os.getenv("CMD_URL")
-        self.device_url = os.getenv("DEVICE_URL")
+        self.base_url = os.getenv("BASE_URL", "https://digil-back-end-onesait.servizi.prv")
+        self.cmd_url = os.getenv("CMD_URL", f"{self.base_url}/api/v1/digils/{{deviceid}}/command")
+        self.device_url = os.getenv("DEVICE_URL", f"{self.base_url}/api/v1/digils/{{deviceid}}")
+        self.config_url = f"{self.base_url}/api/v1/digils/{{deviceid}}/configuration"
+        self.commands_log_url = f"{self.base_url}/api/v1/digils/{{deviceid}}/commands-log"
         self.retry_interval = int(os.getenv("RETRY_INTERVAL_SECONDS", "30"))
         
     def _get_headers(self) -> Dict[str, str]:
@@ -132,24 +137,28 @@ class DIGILApiClient:
             "Accept": "application/json"
         }
     
-    def send_command_no_retry(self, deviceid: str, payload: Dict[str, Any],
-                               timeout: int = 60) -> Tuple[str, Optional[int], str]:
+    def _handle_token_refresh(self, response: requests.Response) -> bool:
+        """Gestisce il refresh del token se necessario. Ritorna True se va ritentato."""
+        if response.status_code in [401, 403]:
+            self.token_manager.invalidate()
+            return True
+        return False
+    
+    def send_command(self, deviceid: str, payload: Dict[str, Any], 
+                     timeout: int = 60) -> Tuple[bool, str, datetime]:
         """
-        Invia un comando a un dispositivo SENZA retry (fire and forget).
-        Una sola chiamata, ritorna immediatamente.
+        Invia un comando a un dispositivo.
         
         Args:
             deviceid: ID del dispositivo
             payload: Payload del comando
-            timeout: Timeout in secondi per la singola richiesta
+            timeout: Timeout in secondi
             
         Returns:
-            (status, timestamp_success, error_message)
-            - status: "OK" se successo, "ERRORE" altrimenti
-            - timestamp_success: timestamp in ms se OK, None altrimenti
-            - error_message: descrizione errore se fallito, "" se OK
+            (success, error_message, sent_time)
         """
         url = self.cmd_url.format(deviceid=deviceid)
+        sent_time = datetime.now(timezone.utc)
         
         try:
             response = requests.post(
@@ -160,9 +169,9 @@ class DIGILApiClient:
                 timeout=timeout
             )
             
-            # Token scaduto/invalido - riprova una volta con nuovo token
-            if response.status_code in [401, 403]:
-                self.token_manager.invalidate()
+            # Token scaduto/invalido - riprova una volta
+            if self._handle_token_refresh(response):
+                sent_time = datetime.now(timezone.utc)
                 response = requests.post(
                     url,
                     json=payload,
@@ -172,94 +181,270 @@ class DIGILApiClient:
                 )
             
             response.raise_for_status()
-            
-            # Successo! Registra il timestamp in millisecondi
-            success_timestamp = int(time.time() * 1000)
-            return ("OK", success_timestamp, "")
+            return (True, "", sent_time)
             
         except requests.exceptions.Timeout:
-            return ("ERRORE", None, "Timeout richiesta")
+            return (False, "Timeout richiesta", sent_time)
         except requests.exceptions.ConnectionError:
-            return ("ERRORE", None, "Connessione fallita")
+            return (False, "Connessione fallita", sent_time)
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response else "N/A"
-            return ("ERRORE", None, f"HTTP {status_code}")
+            return (False, f"HTTP {status_code}", sent_time)
         except Exception as e:
-            return ("ERRORE", None, str(e))
+            return (False, str(e), sent_time)
     
-    def send_command(self, deviceid: str, payload: Dict[str, Any], 
-                     max_minutes: int = 10,
-                     progress_callback=None) -> Tuple[str, int, Optional[int]]:
+    def get_commands_log(self, deviceid: str, 
+                         start_date: datetime,
+                         end_date: Optional[datetime] = None) -> Tuple[bool, Optional[Dict], str]:
         """
-        Invia un comando a un dispositivo con retry automatico.
+        Ottiene il log dei comandi per un dispositivo.
         
         Args:
             deviceid: ID del dispositivo
-            payload: Payload del comando
-            max_minutes: Timeout massimo in minuti
-            progress_callback: Callback per aggiornamenti (deviceid, message, attempt)
+            start_date: Data inizio ricerca (UTC)
+            end_date: Data fine ricerca (UTC), default=now
             
         Returns:
-            (status, attempts, timestamp_success) - timestamp_success è in millisecondi epoch se OK
+            (success, data, error_message)
+            data contiene: {"pendingCommands": [...], "sentCommands": [...]}
         """
-        url = self.cmd_url.format(deviceid=deviceid)
-        start_time = time.time()
-        max_seconds = max_minutes * 60
-        attempt = 0
-        last_error = None
+        if end_date is None:
+            end_date = datetime.now(timezone.utc)
         
-        while True:
-            attempt += 1
-            elapsed = time.time() - start_time
+        # Formatta le date nel formato richiesto dall'API
+        start_str = start_date.strftime("%Y-%m-%dT%H:%M:%S.000000000Z")
+        end_str = end_date.strftime("%Y-%m-%dT%H:%M:%S.999999999Z")
+        
+        url = f"{self.commands_log_url.format(deviceid=deviceid)}?startDate={start_str}&endDate={end_str}"
+        
+        try:
+            response = requests.get(
+                url,
+                headers=self._get_headers(),
+                verify=False,
+                timeout=30
+            )
             
-            # Check timeout
-            if elapsed >= max_seconds:
-                return (f"TIMEOUT dopo {attempt} tentativi ({max_minutes} min)", attempt, None)
-            
-            if progress_callback:
-                remaining = int(max_seconds - elapsed)
-                progress_callback(deviceid, f"Tentativo {attempt} ({remaining}s rimanenti)", attempt)
-            
-            try:
-                response = requests.post(
+            if self._handle_token_refresh(response):
+                response = requests.get(
                     url,
-                    json=payload,
                     headers=self._get_headers(),
                     verify=False,
-                    timeout=60
+                    timeout=30
                 )
-                
-                # Token scaduto/invalido
-                if response.status_code in [401, 403]:
-                    self.token_manager.invalidate()
-                    continue
-                
-                response.raise_for_status()
-                
-                # Successo! Registra il timestamp in millisecondi (stesso formato API)
-                success_timestamp = int(time.time() * 1000)
-                return ("OK", attempt, success_timestamp)
-                
-            except requests.exceptions.Timeout:
-                last_error = "Timeout richiesta"
-            except requests.exceptions.ConnectionError:
-                last_error = "Device irraggiungibile"
-            except requests.exceptions.HTTPError as e:
-                status_code = e.response.status_code if e.response else "N/A"
-                last_error = f"HTTP {status_code}"
-            except Exception as e:
-                last_error = str(e)
             
-            # Attendi prima del prossimo tentativo
-            remaining = max_seconds - (time.time() - start_time)
-            if remaining > self.retry_interval:
-                time.sleep(self.retry_interval)
-            elif remaining > 0:
-                time.sleep(remaining)
-            else:
-                break
+            response.raise_for_status()
+            return (True, response.json(), "")
+            
+        except requests.exceptions.Timeout:
+            return (False, None, "Timeout")
+        except requests.exceptions.ConnectionError:
+            return (False, None, "Connessione fallita")
+        except requests.exceptions.HTTPError as e:
+            return (False, None, f"HTTP {e.response.status_code}")
+        except Exception as e:
+            return (False, None, str(e))
+    
+    def get_device_configuration(self, deviceid: str) -> Tuple[bool, Optional[Dict], str]:
+        """
+        Ottiene la configurazione di un dispositivo.
         
-        return (f"FALLITO: {last_error}", attempt, None)
+        Args:
+            deviceid: ID del dispositivo
+            
+        Returns:
+            (success, data, error_message)
+        """
+        url = self.config_url.format(deviceid=deviceid)
+        
+        try:
+            response = requests.get(
+                url,
+                headers=self._get_headers(),
+                verify=False,
+                timeout=30
+            )
+            
+            if self._handle_token_refresh(response):
+                response = requests.get(
+                    url,
+                    headers=self._get_headers(),
+                    verify=False,
+                    timeout=30
+                )
+            
+            response.raise_for_status()
+            return (True, response.json(), "")
+            
+        except requests.exceptions.Timeout:
+            return (False, None, "Timeout")
+        except requests.exceptions.ConnectionError:
+            return (False, None, "Connessione fallita")
+        except requests.exceptions.HTTPError as e:
+            return (False, None, f"HTTP {e.response.status_code}")
+        except Exception as e:
+            return (False, None, str(e))
+    
+    def get_maintenance_status(self, deviceid: str) -> Tuple[bool, Optional[str], str]:
+        """
+        Ottiene lo stato di manutenzione di un dispositivo.
+        
+        Returns:
+            (success, status, error_message)
+            status può essere: "ON", "OFF", None (non letto)
+        """
+        success, data, error = self.get_device_configuration(deviceid)
+        
+        if not success:
+            return (False, None, error)
+        
+        try:
+            application = data.get("application", {})
+            maintenance_mode = application.get("maintenanceMode")
+            return (True, maintenance_mode, "")
+        except Exception as e:
+            return (False, None, f"Errore parsing: {e}")
+    
+    def check_command_in_log(self, deviceid: str, 
+                             command_name: str,
+                             command_payload_match: Dict[str, Any],
+                             sent_after: datetime) -> Dict[str, Any]:
+        """
+        Verifica lo stato di un comando nel log.
+        
+        Args:
+            deviceid: ID del dispositivo
+            command_name: Nome del comando (es. "maintenance", "set_value")
+            command_payload_match: Dizionario con valori da matchare nel payload
+            sent_after: Il comando deve essere stato inviato DOPO questa data
+            
+        Returns:
+            {
+                "found": bool,
+                "status": "pending" | "sent_ok" | "sent_error" | "not_found",
+                "response_status": str | None,
+                "correlation_id": str | None,
+                "error": str,
+                "debug_info": str
+            }
+        """
+        result = {
+            "found": False,
+            "status": "not_found",
+            "response_status": None,
+            "correlation_id": None,
+            "error": "",
+            "debug_info": ""
+        }
+        
+        # Ottieni il log dei comandi - usa un range più ampio (1 ora prima)
+        search_start = sent_after - timedelta(hours=1)
+        success, data, error = self.get_commands_log(deviceid, search_start)
+        
+        if not success:
+            result["error"] = error
+            return result
+        
+        # Debug info
+        pending_count = len(data.get("pendingCommands", []))
+        sent_count = len(data.get("sentCommands", []))
+        result["debug_info"] = f"pending={pending_count}, sent={sent_count}"
+        
+        # Cerca nei pendingCommands
+        pending_commands = data.get("pendingCommands", [])
+        for cmd in pending_commands:
+            if self._command_matches(cmd, command_name, command_payload_match, sent_after):
+                result["found"] = True
+                result["status"] = "pending"
+                result["correlation_id"] = cmd.get("correlationId")
+                return result
+        
+        # Cerca nei sentCommands
+        sent_commands = data.get("sentCommands", [])
+        for cmd in sent_commands:
+            if self._command_matches(cmd, command_name, command_payload_match, sent_after):
+                result["found"] = True
+                result["correlation_id"] = cmd.get("correlationId")
+                
+                # Controlla la response
+                response = cmd.get("response")
+                if response:
+                    status_str = str(response.get("status", ""))
+                    result["response_status"] = status_str
+                    
+                    # 200 e 204 sono OK (anche come float "200.0", "204.0")
+                    status_clean = status_str.replace(".0", "")
+                    if status_clean in ["200", "204"]:
+                        result["status"] = "sent_ok"
+                    else:
+                        result["status"] = "sent_error"
+                else:
+                    # Comando inviato ma senza response ancora
+                    result["status"] = "sent_no_response"
+                
+                return result
+        
+        # Non trovato - aggiungi info debug
+        result["debug_info"] += f" | cercato: name={command_name}, match={command_payload_match}, after={sent_after.isoformat()}"
+        
+        return result
+    
+    def _command_matches(self, cmd: Dict, command_name: str, 
+                         payload_match: Dict, sent_after: datetime) -> bool:
+        """Verifica se un comando nel log corrisponde ai criteri"""
+        import json
+        
+        # Controlla il nome
+        if cmd.get("name") != command_name:
+            return False
+        
+        # Controlla il timestamp
+        cmd_time_str = cmd.get("time", "")
+        try:
+            # Parse del timestamp ISO
+            cmd_time = datetime.fromisoformat(cmd_time_str.replace("Z", "+00:00"))
+            # Aggiungi un margine di 5 secondi per tolleranza
+            margin = timedelta(seconds=5)
+            if cmd_time < (sent_after - margin):
+                return False
+        except Exception as e:
+            print(f"DEBUG: Errore parsing timestamp: {e}")
+            return False
+        
+        # Controlla il payload
+        cmd_payload_str = cmd.get("payload", "{}")
+        try:
+            # Il payload può essere una stringa JSON con newlines e spazi
+            # Es: "{\n  \"status\" : \"ON\"\n}"
+            if isinstance(cmd_payload_str, str):
+                # Pulisci la stringa e parsa
+                cmd_payload = json.loads(cmd_payload_str)
+            else:
+                cmd_payload = cmd_payload_str
+            
+            # Verifica che tutti i valori in payload_match siano presenti
+            for key, value in payload_match.items():
+                cmd_value = cmd_payload.get(key)
+                # Confronto case-insensitive per stringhe
+                if isinstance(cmd_value, str) and isinstance(value, str):
+                    if cmd_value.upper() != value.upper():
+                        return False
+                elif cmd_value != value:
+                    return False
+                    
+        except json.JSONDecodeError:
+            # Fallback: cerca le stringhe nel payload grezzo
+            # Normalizza rimuovendo spazi e newlines
+            normalized = cmd_payload_str.replace(" ", "").replace("\n", "").lower()
+            for key, value in payload_match.items():
+                search_str = f'"{key}":"{value}"'.lower().replace(" ", "")
+                if search_str not in normalized:
+                    return False
+        except Exception as e:
+            print(f"DEBUG: Errore matching payload: {e}")
+            return False
+        
+        return True
     
     def get_device_data(self, deviceid: str) -> Tuple[bool, Optional[Dict], str]:
         """
@@ -281,10 +466,7 @@ class DIGILApiClient:
                 timeout=30
             )
             
-            # Token scaduto
-            if response.status_code in [401, 403]:
-                self.token_manager.invalidate()
-                # Riprova una volta con nuovo token
+            if self._handle_token_refresh(response):
                 response = requests.get(
                     url,
                     headers=self._get_headers(),
@@ -309,20 +491,7 @@ class DIGILApiClient:
                                    tolerance: float = 0.20) -> Dict[str, Any]:
         """
         Verifica che il reset dell'inclinometro sia andato a buon fine.
-        
-        Controlla:
-        1. ALG_Digil2_Alm_Incl == false
-        2. SENS_Digil2_Inc_X.avg ~ 0 (entro tolleranza)
-        3. SENS_Digil2_Inc_Y.avg ~ 0 (entro tolleranza)
-        4. Il timestamp dei dati sia DOPO il reset_timestamp
-        
-        Args:
-            deviceid: ID del dispositivo
-            reset_timestamp: Timestamp in millisecondi di quando è stato eseguito il reset
-            tolerance: Tolleranza per i valori di inclinazione
-            
-        Returns:
-            Dict con i risultati della verifica
+        (Mantenuto per compatibilità con Fase 2)
         """
         result = {
             "deviceid": deviceid,
@@ -343,7 +512,6 @@ class DIGILApiClient:
             "error": ""
         }
         
-        # Chiama l'API
         success, data, error = self.get_device_data(deviceid)
         
         if not success:
@@ -352,13 +520,11 @@ class DIGILApiClient:
         
         result["api_success"] = True
         
-        # Estrai i dati di diagnosi (allarmi)
         diags = data.get("diags", {})
         alm_incl = diags.get("ALG_Digil2_Alm_Incl", {})
         result["alarm_incl"] = alm_incl.get("value")
         result["alarm_incl_timestamp"] = alm_incl.get("timestamp")
         
-        # Estrai le misure di inclinazione
         measures = data.get("measures", {})
         
         inc_x = measures.get("SENS_Digil2_Inc_X", {})
@@ -369,20 +535,15 @@ class DIGILApiClient:
         result["inc_y_avg"] = inc_y.get("avg")
         result["inc_y_timestamp"] = inc_y.get("timestamp")
         
-        # Verifica allarme (deve essere false)
         if result["alarm_incl"] is not None:
             result["alarm_ok"] = (result["alarm_incl"] == False)
         
-        # Verifica inclinazione X (deve essere ~ 0)
         if result["inc_x_avg"] is not None:
             result["inc_x_ok"] = abs(result["inc_x_avg"]) <= tolerance
         
-        # Verifica inclinazione Y (deve essere ~ 0)
         if result["inc_y_avg"] is not None:
             result["inc_y_ok"] = abs(result["inc_y_avg"]) <= tolerance
         
-        # Verifica timestamp (i dati devono essere DOPO il reset)
-        # Usa il timestamp più recente tra le misure
         data_timestamps = [
             result["alarm_incl_timestamp"],
             result["inc_x_timestamp"],
@@ -396,7 +557,6 @@ class DIGILApiClient:
             result["data_timestamp"] = latest_timestamp
             result["timestamp_delta_ms"] = latest_timestamp - reset_timestamp
         
-        # Tutto OK?
         result["all_ok"] = (
             result["alarm_ok"] and 
             result["inc_x_ok"] and 
@@ -430,7 +590,7 @@ def get_api_client() -> DIGILApiClient:
 
 if __name__ == "__main__":
     # Test del modulo
-    print("Test API Client")
+    print("Test API Client v2.0")
     print("=" * 50)
     
     tm = get_token_manager()
@@ -439,10 +599,11 @@ if __name__ == "__main__":
     
     if success:
         client = get_api_client()
-        print("\nTest get_device_data...")
-        success, data, error = client.get_device_data("1121621_0436")
+        
+        # Test get_maintenance_status
+        print("\nTest get_maintenance_status...")
+        success, status, error = client.get_maintenance_status("1121622_0364")
         if success:
-            print(f"Device name: {data.get('name')}")
-            print(f"Status: {data.get('status')}")
+            print(f"Maintenance status: {status}")
         else:
             print(f"Error: {error}")

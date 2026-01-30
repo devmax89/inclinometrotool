@@ -1,5 +1,5 @@
-# DIGIL Reset Inclinometro - Dependencies
-# ========================================
+# DIGIL Reset Inclinometro v2.0 - Dependencies
+# =============================================
 
 # GUI Framework
 PyQt5>=5.15.9
